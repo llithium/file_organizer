@@ -1,0 +1,10 @@
+[package]
+name = "file_organizer"
+version = "0.2.0"
+edition = "2024"
+
+[[bin]]
+name = "fo"
+path = "src/main.rs"
+
+[dependencies]
