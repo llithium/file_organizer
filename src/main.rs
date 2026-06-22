@@ -34,6 +34,10 @@ struct Args {
     #[arg(short = 'n', long)]
     dry_run: bool,
 
+    /// Remove subdirectories left empty after organizing (requires --recursive)
+    #[arg(short = 'd', long, requires = "recursive")]
+    delete_empty_dirs: bool,
+
     /// Print each file operation as it is performed
     #[arg(short, long)]
     verbose: bool,
@@ -92,6 +96,7 @@ fn category_for(ext: &str) -> Option<&'static str> {
 struct Stats {
     moved: u32,
     skipped: u32,
+    removed_dirs: u32,
 }
 
 fn organize_files(args: &Args, root: &Path) -> io::Result<()> {
@@ -111,22 +116,39 @@ fn organize_files(args: &Args, root: &Path) -> io::Result<()> {
     let mut stats = Stats {
         moved: 0,
         skipped: 0,
+        removed_dirs: 0,
     };
     organize_dir(args, root, root, &category_names, &mut stats)?;
 
     let label = if args.dry_run { "would move" } else { "moved" };
-    println!("\nDone: {} {}, {} skipped.", stats.moved, label, stats.skipped);
+    print!("\nDone: {} {}, {} skipped", stats.moved, label, stats.skipped);
+    if args.delete_empty_dirs {
+        let dir_label = if args.dry_run {
+            "would remove"
+        } else {
+            "removed"
+        };
+        print!(", {} {} empty dir(s)", stats.removed_dirs, dir_label);
+    }
+    println!(".");
     Ok(())
 }
 
+/// Organizes a single directory, recursing into subdirectories when requested.
+///
+/// Returns `true` if the directory is (or, in dry-run mode, would be) empty
+/// once organizing is complete, so the caller can prune it when
+/// `--delete-empty-dirs` is set.
 fn organize_dir(
     args: &Args,
     root: &Path,
     dir_path: &Path,
     category_dirs: &[PathBuf],
     stats: &mut Stats,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let mut subdirs: Vec<PathBuf> = Vec::new();
+    // Count entries that will remain in this directory after organizing.
+    let mut remaining = 0u32;
 
     for entry in fs::read_dir(dir_path)? {
         let entry = entry?;
@@ -134,24 +156,33 @@ fn organize_dir(
 
         if path.is_dir() {
             // Never descend into the category folders themselves.
-            if !category_dirs.iter().any(|c| c == &path) {
+            if category_dirs.iter().any(|c| c == &path) {
+                remaining += 1;
+            } else {
                 subdirs.push(path);
             }
             continue;
         }
 
         if !path.is_file() {
+            remaining += 1;
             continue;
         }
 
         let ext = match path.extension().and_then(|e| e.to_str()) {
             Some(e) => e.to_lowercase(),
-            None => continue,
+            None => {
+                remaining += 1;
+                continue;
+            }
         };
 
         let category = match category_for(&ext) {
             Some(c) => c,
-            None => continue,
+            None => {
+                remaining += 1;
+                continue;
+            }
         };
 
         let target_dir = root.join(category);
@@ -168,6 +199,7 @@ fn organize_dir(
         if let Err(e) = fs::create_dir_all(&target_dir) {
             eprintln!("Skipped {}: {}", path.display(), e);
             stats.skipped += 1;
+            remaining += 1;
             continue;
         }
 
@@ -181,17 +213,39 @@ fn organize_dir(
             Err(e) => {
                 eprintln!("Skipped {}: {}", path.display(), e);
                 stats.skipped += 1;
+                remaining += 1;
             }
         }
     }
 
     if args.recursive {
         for subdir in subdirs {
-            organize_dir(args, root, &subdir, category_dirs, stats)?;
+            let child_empty = organize_dir(args, root, &subdir, category_dirs, stats)?;
+
+            if args.delete_empty_dirs && child_empty {
+                if args.dry_run {
+                    stats.removed_dirs += 1;
+                    println!("[dry-run] remove empty dir {}", subdir.display());
+                } else if let Err(e) = fs::remove_dir(&subdir) {
+                    eprintln!("Could not remove {}: {}", subdir.display(), e);
+                    remaining += 1;
+                } else {
+                    stats.removed_dirs += 1;
+                    if args.verbose {
+                        println!("removed empty dir {}", subdir.display());
+                    }
+                }
+            } else {
+                // Subdir left in place (kept, or not eligible for pruning).
+                remaining += 1;
+            }
         }
+    } else {
+        // Without recursion, subdirectories are left untouched.
+        remaining += subdirs.len() as u32;
     }
 
-    Ok(())
+    Ok(remaining == 0)
 }
 
 fn main() {
